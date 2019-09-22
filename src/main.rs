@@ -4,8 +4,8 @@ use std::{
     fmt::{self, Formatter, Display},
     fs::{self, File},
     collections::{hash_map, HashMap},
-    cell::RefCell,
-    io::{self, Read, Seek}
+    io::{self, Read, Seek},
+    time
 };
 
 use structopt::StructOpt;
@@ -13,9 +13,10 @@ use rand::{
     prelude::*,
     distributions::Alphanumeric
 };
-use serde::{Serialize, Serializer, ser::SerializeSeq};
+use serde::{Serialize, Deserialize, Serializer, ser::SerializeSeq};
 use either::Either;
 use failure::{self, format_err, bail, Fallible};
+use log::{warn, debug};
 
 #[derive(Debug, StructOpt)]
 #[structopt(name = "fsgrinder")]
@@ -42,7 +43,11 @@ enum Arguments {
         #[structopt(parse(from_os_str))]
         /// Path that shall serve as the reference file system (i.e. a mature file system that can
         /// be trusted).
-        reference_path: PathBuf
+        reference_path: PathBuf,
+        #[structopt(short = "t", long, required_unless = "rounds")]
+        timeout: Option<usize>,
+        #[structopt(short = "r", long, required_unless = "timeout")]
+        rounds: Option<usize>,
     },
 
     /// Replay a previously recorded (or hand crafted) file system action log.
@@ -62,24 +67,44 @@ enum Arguments {
     }
 }
 
-#[derive(Clone, Copy)]
-struct RefCellRng<'a, R: RngCore>(&'a RefCell<R>);
+enum GrindDurationKeeper {
+    Timeout {
+        start: time::Instant,
+        timeout: time::Duration
+    },
+    Rounds  {
+        elapsed: usize,
+        max: usize
+    }
+}
 
-impl<'a, R: RngCore> RngCore for RefCellRng<'a, R> {
-    fn next_u32(&mut self) -> u32 {
-        self.0.borrow_mut().next_u32()
+impl GrindDurationKeeper {
+}
+
+impl GrindDurationKeeper {
+    fn with_rounds(rounds: usize) -> Self {
+        GrindDurationKeeper::Rounds {
+            max: rounds,
+            elapsed: 0
+        }
     }
 
-    fn next_u64(&mut self) -> u64 {
-        self.0.borrow_mut().next_u64()
+    fn with_timeout(timeout: usize) -> Self {
+        GrindDurationKeeper::Timeout {
+            start: time::Instant::now(),
+            timeout: time::Duration::from_secs(timeout as u64)
+        }
     }
 
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        self.0.borrow_mut().fill_bytes(dest)
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
-        self.0.borrow_mut().try_fill_bytes(dest)
+    fn elapsed(&mut self) -> bool {
+        match self {
+            GrindDurationKeeper::Timeout { timeout, start } =>
+                time::Instant::now() - *start > *timeout,
+            GrindDurationKeeper::Rounds { elapsed, max } => {
+                *elapsed += 1;
+                max < elapsed
+            }
+        }
     }
 }
 
@@ -92,58 +117,28 @@ impl<R: Rng> Read for RandomReader<R> {
     }
 }
 
-mod seekfrom_serde {
-    use std::{
-        borrow::Cow,
-        io::SeekFrom,
-        convert::TryInto
-    };
+#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+enum SeekMode {
+    Start,
+    Current,
+    End
+}
 
-    use serde::{Serialize, Deserialize, Serializer, Deserializer, de::Error};
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct SeekPos {
+    seek_mode: SeekMode,
+    rel_seek_pos: f32
+}
 
-    #[derive(Debug, Serialize, Deserialize)]
-    struct SeekPos {
-        seek_mode: Cow<'static, str>,
-        seek_offset: i64
-    }
-
-    impl TryInto<SeekFrom> for SeekPos {
-        type Error = String;
-
-        fn try_into(self) -> Result<SeekFrom, Self::Error> {
-            match self.seek_mode.as_ref() {
-                "begin" => Ok(SeekFrom::Start(self.seek_offset as u64)),
-                "cur" => Ok(SeekFrom::Current(self.seek_offset)),
-                "end" => Ok(SeekFrom::End(self.seek_offset)),
-                _ => Err(format!("Unable to translate \"{}\" into a seek operation", &self.seek_mode))
-            }
+impl SeekPos {
+    fn into_seek_from(self, file_pos: u64, file_size: u64) -> SeekFrom {
+        let newpos = (self.rel_seek_pos * (file_size as f32)) as i64;
+        match self.seek_mode {
+            SeekMode::Start => SeekFrom::Start(newpos as u64),
+            SeekMode::Current => SeekFrom::Current(newpos - (file_pos as i64)),
+            SeekMode::End => SeekFrom::End(newpos - (file_size as i64))
         }
-    }
-
-    impl From<SeekFrom> for SeekPos {
-        fn from(val: SeekFrom) -> Self {
-            let (seek_mode, seek_offset) = match val {
-                SeekFrom::Start(offset) => ("start", offset as i64),
-                SeekFrom::Current(offset) => ("cur", offset),
-                SeekFrom::End(offset) => ("end", offset),
-            };
-
-            Self {
-                seek_mode: Cow::Borrowed(seek_mode),
-                seek_offset
-            }
-        }
-    }
-
-    pub fn serialize<S: Serializer>(val: &SeekFrom, serializer: S) -> Result<S::Ok, S::Error> {
-        let seekpos = SeekPos::from(val.clone());
-        seekpos.serialize(serializer)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<SeekFrom, D::Error> {
-        SeekPos::deserialize(deserializer)
-            .and_then(|pos|
-                pos.try_into().map_err(D::Error::custom))
     }
 }
 
@@ -157,8 +152,7 @@ enum FSOperation {
     },
     SeekOpenFile {
         file_path: PathBuf,
-        #[serde(with = "seekfrom_serde")]
-        seek_pos: SeekFrom
+        seek_pos: SeekPos
     },
     CloseFile {
         file_path: PathBuf
@@ -175,18 +169,14 @@ enum FSOperation {
 
 const NUM_FS_OPERATIONS: usize = 6;
 
-struct SeekFromDisplay<'a>(&'a SeekFrom);
-
-impl<'a> Display for SeekFromDisplay<'a> {
+impl Display for SeekPos {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        match self.0 {
-            SeekFrom::Start(offset) =>
-                write!(f, "{} bytes from start", offset),
-            SeekFrom::Current(offset) =>
-                write!(f, "{} bytes from the current position", offset),
-            SeekFrom::End(offset) =>
-                write!(f, "{} bytes back from the end", -*offset),
-        }
+        let mode = match self.seek_mode {
+            SeekMode::Start => "start",
+            SeekMode::Current => "current position",
+            SeekMode::End => "end",
+        };
+        write!(f, "{}% from the {}", self.rel_seek_pos * 100.0, mode)
     }
 }
 
@@ -196,7 +186,7 @@ impl Display for FSOperation {
             FSOperation::WriteRandomData { file_path, written_size } =>
                 write!(f, "Write {} random bytes to {}", written_size, file_path.display()),
             FSOperation::SeekOpenFile { file_path, seek_pos } =>
-                write!(f, "Seek to {} in file {}", SeekFromDisplay(seek_pos), file_path.display()),
+                write!(f, "Seek to {} in file {}", seek_pos, file_path.display()),
             FSOperation::OpenFile { file_path } =>
                 write!(f, "Open {}", file_path.display()),
             FSOperation::CreateFile { file_path } =>
@@ -211,33 +201,12 @@ impl Display for FSOperation {
 
 #[derive(Debug, Clone)]
 struct FileDescriptor {
-    path: PathBuf,
-    size: u64
+    path: PathBuf
 }
 
 #[derive(Debug, Clone)]
 struct OpenFileDescriptor {
-    file_desc: FileDescriptor,
-    pos: u64
-}
-
-impl Seek for OpenFileDescriptor {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        let newpos = match pos {
-            SeekFrom::Start(newpos) => newpos as i64,
-            SeekFrom::Current(offset) => self.pos as i64 + offset,
-            SeekFrom::End(offset) => self.file_desc.size as i64 + offset,
-        };
-
-        if newpos < 0 {
-            Err(io::Error::new(io::ErrorKind::InvalidInput,
-                               "Attempt to seek before start of file"))
-        } else {
-            self.file_desc.size = self.file_desc.size.max(newpos as u64);
-            self.pos = newpos as u64;
-            Ok(self.pos)
-        }
-    }
+    file_desc: FileDescriptor
 }
 
 struct RandFSOpGenerator<R: Rng> {
@@ -271,7 +240,7 @@ impl<R: Rng> Iterator for RandFSOpGenerator<R> {
         let operation = loop {
             let operation_index = self.rng.gen_range(0, NUM_FS_OPERATIONS);
             match operation_index {
-                0 => if let Some(OpenFileDescriptor { file_desc: closed_file, pos: _ }) =
+                0 => if let Some(OpenFileDescriptor { file_desc: closed_file }) =
                 self.open_files.remove_random(&mut self.rng) {
                     let result = FSOperation::CloseFile { file_path: closed_file.path.clone() };
                     self.existing_files.push(closed_file);
@@ -284,48 +253,39 @@ impl<R: Rng> Iterator for RandFSOpGenerator<R> {
                     self.open_files.push(OpenFileDescriptor {
                         file_desc: FileDescriptor {
                             path: path.clone(),
-                            size: 0
                         },
-                        pos: 0
                     });
                     break FSOperation::CreateFile { file_path: path };
                 },
                 2 => if let Some(open_file) = self.existing_files.remove_random(&mut self.rng) {
                     let result = FSOperation::OpenFile { file_path: open_file.path.clone() };
                     self.open_files.push(OpenFileDescriptor {
-                        file_desc: open_file,
-                        pos: 0
+                        file_desc: open_file
                     });
                     break result;
                 },
                 3 => if let Some(file) = self.open_files.choose_mut(&mut self.rng) {
-                    if file.file_desc.size > 0 {
-                        let seek_pos = match self.rng.gen_range(0, 3) {
-                            0 => SeekFrom::Start(self.rng.gen_range(1, file.file_desc.size)),
-                            1 => SeekFrom::Current(self.rng.gen_range(-(file.pos as i64), (file.file_desc.size-file.pos) as i64)),
-                            2 => SeekFrom::End(self.rng.gen_range(-(file.file_desc.size as i64), -1)),
-                            _ => unreachable!()
-                        };
-                        file.seek(seek_pos).unwrap();
-                        break FSOperation::SeekOpenFile { file_path: file.file_desc.path.clone(), seek_pos };
-                    }
+                    let seek_mode = match self.rng.gen_range(0, 3) {
+                        0 => SeekMode::Start,
+                        1 => SeekMode::Current,
+                        2 => SeekMode::End,
+                        _ => unreachable!()
+                    };
+                    let rel_seek_pos = self.rng.gen_range(0u32, 2 * 1048576) as f32 / 1048576.0;
+                    break FSOperation::SeekOpenFile {
+                        file_path: file.file_desc.path.clone(),
+                        seek_pos: SeekPos { seek_mode, rel_seek_pos } };
                 },
                 4 => if let Some(file) = self.open_files.choose_mut(&mut self.rng) {
                     let written_size = self.rng.gen_range(1, 2048);
-                    file.pos += written_size;
-                    file.file_desc.size = file.pos.max(file.file_desc.size);
                     break FSOperation::WriteRandomData { file_path: file.file_desc.path.clone(), written_size };
                 },
                 5 => if let Some(file) = self.open_files.choose_mut(&mut self.rng) {
-                    let possible_read_size = file.file_desc.size - file.pos;
-                    if possible_read_size > 0 {
-                        let read_size = self.rng.gen_range(1, possible_read_size);
-                        file.pos += read_size;
-                        break FSOperation::ReadData {
-                            read_size,
-                            file_path: file.file_desc.path.clone()
-                        };
-                    }
+                    let read_size = self.rng.gen_range(1, 2048);
+                    break FSOperation::ReadData {
+                        read_size,
+                        file_path: file.file_desc.path.clone()
+                    };
                 }
                 _ => panic!("NUM_FS_OPERATIONS larger than number of FSOperarion variants")
             }
@@ -416,9 +376,13 @@ Result of assessed FS
     }
 }
 
+struct GrinderFile {
+    file: File,
+}
+
 struct FSGrinder<R> {
     base_path: PathBuf,
-    open_files: HashMap<PathBuf, File>,
+    open_files: HashMap<PathBuf, GrinderFile>,
     rng: R
 }
 
@@ -430,9 +394,16 @@ impl<R: Rng> FSOperationExecutor for FSGrinder<R> {
             FSOperation::SeekOpenFile { seek_pos, ref file_path } => {
                 let file = self.open_files.get_mut(file_path)
                     .ok_or(format_err!("Unable to find open file {}", file_path.display()))?;
-                file.seek(seek_pos)
-                    .map(FSOperationResult::Position)
-                    .map_err(Into::into)
+                let file_pos = file.file.seek(SeekFrom::Current(0)).unwrap() as u64;
+                let file_size = file.file.seek(SeekFrom::End(0)).unwrap() as u64;
+                // restore previous position
+                file.file.seek(SeekFrom::Start(file_pos)).unwrap();
+                let seek_from = seek_pos.into_seek_from(file_pos, file_size);
+                debug!("Converted seek_pos for {} from {}/{}: {:?}",
+                       file_path.display(), file_pos, file_size, &seek_from);
+                file.file.seek(seek_from).unwrap();
+                let new_file_pos = file.file.seek(SeekFrom::Current(0)).unwrap() as u64;
+                Ok(FSOperationResult::Position(new_file_pos))
             }
 
             FSOperation::CloseFile { ref file_path } =>
@@ -448,16 +419,27 @@ impl<R: Rng> FSOperationExecutor for FSGrinder<R> {
                 let file = self.open_files.get_mut(file_path).ok_or(
                     format_err!("Unable to find open file {} for writing", file_path.display()))?;
                 let mut reader = RandomReader(&mut self.rng).take(written_size);
-                io::copy(&mut reader, file)
+                io::copy(&mut reader, &mut file.file)
                     .map(|_| FSOperationResult::Done)
                     .map_err(|e| format_err!("Failed to write {} bytes to {}: {}", written_size, file_path.display(), e))
             }
 
             FSOperation::ReadData { read_size, ref file_path } => {
                 let file = self.open_files.get_mut(file_path).ok_or(
-                    format_err!("Unable to find open file {} for reading", file_path.display()))?;
+                    format_err!("Unable to find open finle {} for reading", file_path.display()))?;
+                let file_pos = file.file.seek(SeekFrom::Current(0)).unwrap();
+                let file_size = file.file.seek(SeekFrom::End(0)).unwrap();
+                // restore previous position
+                file.file.seek(SeekFrom::Start(file_pos)).unwrap();
+                let data_size = if file_size > file_pos {
+                    read_size.min(file_size - file_pos) as usize
+                } else {
+                    0usize
+                };
+                debug!("Read {} bytes from {} at {}/{}", data_size, file_path.display(), file_pos, file_size);
                 let mut data = Vec::with_capacity(read_size as usize);
-                file.read_exact(data.as_mut())
+                data.resize(data_size, 0);
+                file.file.read_exact(data.as_mut())
                     .map(move |_| FSOperationResult::Data(data))
                     .map_err(|e| format_err!("Unable to read {} bytes from {}: {}", read_size, file_path.display(), e))
             }
@@ -483,6 +465,9 @@ impl<R: Rng> FSGrinder<R> {
             .map_err(failure::Error::from)
             .and_then(|file| match self.open_files.entry(file_path) {
                 hash_map::Entry::Vacant(entry) => {
+                    let file = GrinderFile {
+                        file
+                    };
                     entry.insert(file);
                     Ok(FSOperationResult::Done)
                 }
@@ -528,13 +513,15 @@ impl<S, F> FSOperationExecutor for FSOperationSerializer<S, F>
 impl<S, F> Drop for FSOperationSerializer<S, F> where S: SerializeSeq {
     fn drop(&mut self) {
         if let Err(e) = self.ser.take().unwrap().end() {
-            eprintln!("Unable to end log sequence: {}", e);
+            warn!("Unable to end log sequence: {}", e);
         }
     }
 }
 
-fn grind(log_output: Option<PathBuf>, reference_path: PathBuf, assessed_path: PathBuf)
-    -> Fallible<()> {
+fn grind(log_output: Option<PathBuf>,
+         reference_path: PathBuf,
+         assessed_path: PathBuf,
+         mut duration_keeper: GrindDurationKeeper) -> Fallible<()> {
     let mut fs_op_rng = SmallRng::from_entropy();
 
     let reference_rng = SmallRng::from_rng(&mut fs_op_rng)?;
@@ -556,7 +543,7 @@ fn grind(log_output: Option<PathBuf>, reference_path: PathBuf, assessed_path: Pa
 
     let fs_op_gen = RandFSOpGenerator::new(fs_op_rng);
 
-    for op in fs_op_gen.take(2048) {
+    for op in fs_op_gen.take_while(move |_| !duration_keeper.elapsed()) {
         op_log_and_execute.execute_fs_operation(op)?;
     }
 
@@ -564,13 +551,24 @@ fn grind(log_output: Option<PathBuf>, reference_path: PathBuf, assessed_path: Pa
 }
 
 fn main() {
+    flexi_logger::Logger::with_env().start().unwrap();
+
     let args: Arguments = Arguments::from_args();
     match args {
         Arguments::Grind {
             log_output,
             test_path,
-            reference_path
-        } => grind(log_output, reference_path, test_path),
+            reference_path,
+            timeout,
+            rounds
+        } => {
+            let duration_keeper = if let Some(timeout) = timeout {
+                GrindDurationKeeper::with_timeout(timeout)
+            } else {
+                GrindDurationKeeper::with_rounds(rounds.unwrap())
+            };
+            grind(log_output, reference_path, test_path, duration_keeper)
+        },
         Arguments::Replay { .. } => unimplemented!("replay command still to be done...")
     }.unwrap();
 }
