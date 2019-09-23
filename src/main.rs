@@ -1,10 +1,9 @@
 use std::{
-    io::{SeekFrom, stdout},
     path::PathBuf,
     fmt::{self, Formatter, Display},
     fs::{self, File},
     collections::{hash_map, HashMap},
-    io::{self, Read, Seek},
+    io::{self, Read, Seek, SeekFrom, BufReader, BufWriter},
     time
 };
 
@@ -142,7 +141,7 @@ impl SeekPos {
     }
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 enum FSOperation {
     OpenFile {
         file_path: PathBuf
@@ -532,10 +531,10 @@ fn grind(log_output: Option<PathBuf>,
     let operation_executor = FSOperationComparator::new(reference_fs_grinder, assessed_fs_grinder);
 
     let output = if let Some(log_output_path) = log_output {
-        let file = File::create(log_output_path)?;
+        let file = BufWriter::new(File::create(log_output_path)?);
         Either::Left(file)
     } else {
-        Either::Right(stdout())
+        Either::Right(io::sink())
     };
 
     let mut serializer = serde_json::Serializer::pretty(output);
@@ -545,6 +544,24 @@ fn grind(log_output: Option<PathBuf>,
 
     for op in fs_op_gen.take_while(move |_| !duration_keeper.elapsed()) {
         op_log_and_execute.execute_fs_operation(op)?;
+    }
+
+    Ok(())
+}
+
+fn replay(log_path: PathBuf, reference_path: PathBuf, assessed_path: PathBuf) -> Fallible<()> {
+    let log_file = BufReader::new(File::open(log_path)?);
+    let log: Vec<FSOperation> = serde_json::from_reader(log_file)?;
+
+    let reference_rng = SmallRng::from_entropy();
+    let assessed_rng = reference_rng.clone();
+
+    let assessed_fs_grinder = FSGrinder::new(assessed_path, assessed_rng);
+    let reference_fs_grinder = FSGrinder::new(reference_path, reference_rng);
+    let mut operation_executor = FSOperationComparator::new(reference_fs_grinder, assessed_fs_grinder);
+
+    for op in log {
+        operation_executor.execute_fs_operation(op)?;
     }
 
     Ok(())
@@ -568,7 +585,9 @@ fn main() {
                 GrindDurationKeeper::with_rounds(rounds.unwrap())
             };
             grind(log_output, reference_path, test_path, duration_keeper)
-        },
-        Arguments::Replay { .. } => unimplemented!("replay command still to be done...")
+        }
+
+        Arguments::Replay { log_path, test_path, reference_path } =>
+            replay(log_path, reference_path, test_path)
     }.unwrap();
 }
