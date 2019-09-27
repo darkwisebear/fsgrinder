@@ -20,6 +20,42 @@ use log::{warn, debug};
 use fsoperation::{FSOperation, SeekMode, SeekPos, NUM_FS_OPERATIONS};
 
 #[derive(Debug, StructOpt)]
+struct GrindArguments {
+    #[structopt(short = "l", long, parse(from_os_str))]
+    /// Specifies the path the log file shall be written to. If not specified, output to stdout.
+    log_output: Option<PathBuf>,
+    #[structopt(parse(from_os_str))]
+    /// Path to the file system that shall be assessed.
+    test_path: PathBuf,
+    #[structopt(parse(from_os_str))]
+    /// Path that shall serve as the reference file system (i.e. a mature file system that can
+    /// be trusted).
+    reference_path: PathBuf,
+    #[structopt(short = "t", long, required_unless = "rounds")]
+    /// Time in seconds the grinding shall be executed.
+    ///
+    /// At least one of 'timeout' or 'rounds' must be specified.
+    timeout: Option<usize>,
+    #[structopt(short = "r", long, required_unless = "timeout")]
+    /// Number of operations the grinding shall execute.
+    ///
+    /// At least one of 'timeout' or 'rounds' must be specified.
+    rounds: Option<usize>,
+    #[structopt(long)]
+    /// Maximum number of open files at the same time.
+    ///
+    /// If this number is reached, no additional files will be opened. If files are closed
+    /// again, opening will also be resumed until the maximum number is reached again.
+    max_open_files: Option<usize>,
+    #[structopt(long)]
+    /// Maximum number of files that are to be created during the grind oepration.
+    ///
+    /// If this number is reached, no new files will be created for the duration of the
+    /// assessment.
+    max_created_files: Option<usize>,
+}
+
+#[derive(Debug, StructOpt)]
 #[structopt(name = "fsgrinder")]
 /// Randomly executes file system operations on two paths and compares whether the files and
 /// content are the same.
@@ -34,22 +70,7 @@ enum Arguments {
     /// Randomly execute commands from a set of supported file operations on two file systems.
     ///
     /// The log can optionally be recorded to act as an input for later replay runs.
-    Grind {
-        #[structopt(short = "l", long, parse(from_os_str))]
-        /// Specifies the path the log file shall be written to. If not specified, output to stdout.
-        log_output: Option<PathBuf>,
-        #[structopt(parse(from_os_str))]
-        /// Path to the file system that shall be assessed.
-        test_path: PathBuf,
-        #[structopt(parse(from_os_str))]
-        /// Path that shall serve as the reference file system (i.e. a mature file system that can
-        /// be trusted).
-        reference_path: PathBuf,
-        #[structopt(short = "t", long, required_unless = "rounds")]
-        timeout: Option<usize>,
-        #[structopt(short = "r", long, required_unless = "timeout")]
-        rounds: Option<usize>,
-    },
+    Grind(GrindArguments),
 
     /// Replay a previously recorded (or hand crafted) file system action log.
     ///
@@ -127,6 +148,8 @@ struct OpenFileDescriptor {
 
 struct RandFSOpGenerator<R: Rng> {
     rng: R,
+    max_open_files: Option<usize>,
+    max_created_files: Option<usize>,
     open_files: Vec<OpenFileDescriptor>,
     existing_files: Vec<FileDescriptor>
 }
@@ -163,22 +186,25 @@ impl<R: Rng> Iterator for RandFSOpGenerator<R> {
                     break result;
                 },
                 1 => {
-                    let name_len = self.rng.gen_range(6, 32);
-                    let name = (&mut self.rng).sample_iter(Alphanumeric).take(name_len).collect::<String>();
-                    let path = PathBuf::from(name);
-                    self.open_files.push(OpenFileDescriptor {
-                        file_desc: FileDescriptor {
-                            path: path.clone(),
-                        },
-                    });
-                    break FSOperation::CreateFile { file_path: path };
+                    if !self.max_created_files_reached() {
+                        let name_len = self.rng.gen_range(6, 32);
+                        let name = (&mut self.rng).sample_iter(Alphanumeric).take(name_len).collect::<String>();
+                        let path = PathBuf::from(name);
+                        self.open_files.push(OpenFileDescriptor {
+                            file_desc: FileDescriptor { path: path.clone(), }
+                        });
+
+                        break FSOperation::CreateFile { file_path: path };
+                    }
                 },
                 2 => if let Some(open_file) = self.existing_files.remove_random(&mut self.rng) {
-                    let result = FSOperation::OpenFile { file_path: open_file.path.clone() };
-                    self.open_files.push(OpenFileDescriptor {
-                        file_desc: open_file
-                    });
-                    break result;
+                    if !self.max_open_files_reached() {
+                        let result = FSOperation::OpenFile { file_path: open_file.path.clone() };
+                        self.open_files.push(OpenFileDescriptor {
+                            file_desc: open_file
+                        });
+                        break result;
+                    }
                 },
                 3 => if let Some(file) = self.open_files.choose_mut(&mut self.rng) {
                     let seek_mode = match self.rng.gen_range(0, 3) {
@@ -212,12 +238,26 @@ impl<R: Rng> Iterator for RandFSOpGenerator<R> {
 }
 
 impl<R: Rng> RandFSOpGenerator<R> {
-    fn new(rng: R) -> Self {
+    fn new(rng: R, max_open_files: Option<usize>, max_created_files: Option<usize>) -> Self {
         Self {
             rng,
+            max_open_files,
+            max_created_files,
             open_files: Default::default(),
             existing_files: Default::default()
         }
+    }
+
+    fn max_open_files_reached(&self) -> bool {
+        self.max_open_files
+            .map(|of| self.open_files.len() >= of)
+            .unwrap_or(false)
+    }
+
+    fn max_created_files_reached(&self) -> bool {
+        self.max_created_files
+            .map(|cf| self.open_files.len() + self.existing_files.len() >= cf)
+            .unwrap_or(false)
     }
 }
 
@@ -434,16 +474,29 @@ impl<S, F> Drop for FSOperationSerializer<S, F> where S: SerializeSeq {
     }
 }
 
-fn grind(log_output: Option<PathBuf>,
-         reference_path: PathBuf,
-         assessed_path: PathBuf,
-         mut duration_keeper: GrindDurationKeeper) -> Fallible<()> {
+fn grind(grind_args: GrindArguments) -> Fallible<()> {
+    let GrindArguments {
+        log_output,
+        test_path,
+        reference_path,
+        timeout,
+        rounds,
+        max_created_files,
+        max_open_files
+    } = grind_args;
+
+    let mut duration_keeper = if let Some(timeout) = timeout {
+        GrindDurationKeeper::with_timeout(timeout)
+    } else {
+        GrindDurationKeeper::with_rounds(rounds.unwrap())
+    };
+
     let mut fs_op_rng = SmallRng::from_entropy();
 
     let reference_rng = SmallRng::from_rng(&mut fs_op_rng)?;
     let assessed_rng = reference_rng.clone();
 
-    let assessed_fs_grinder = FSGrinder::new(assessed_path, assessed_rng);
+    let assessed_fs_grinder = FSGrinder::new(test_path, assessed_rng);
     let reference_fs_grinder = FSGrinder::new(reference_path, reference_rng);
     let operation_executor = FSOperationComparator::new(reference_fs_grinder, assessed_fs_grinder);
 
@@ -457,7 +510,7 @@ fn grind(log_output: Option<PathBuf>,
     let mut serializer = serde_json::Serializer::pretty(output);
     let mut op_log_and_execute = FSOperationSerializer::new(&mut serializer, operation_executor)?;
 
-    let fs_op_gen = RandFSOpGenerator::new(fs_op_rng);
+    let fs_op_gen = RandFSOpGenerator::new(fs_op_rng, max_open_files, max_created_files);
 
     for op in fs_op_gen.take_while(move |_| !duration_keeper.elapsed()) {
         op_log_and_execute.execute_fs_operation(op)?;
@@ -489,21 +542,7 @@ fn main() {
 
     let args: Arguments = Arguments::from_args();
     match args {
-        Arguments::Grind {
-            log_output,
-            test_path,
-            reference_path,
-            timeout,
-            rounds
-        } => {
-            let duration_keeper = if let Some(timeout) = timeout {
-                GrindDurationKeeper::with_timeout(timeout)
-            } else {
-                GrindDurationKeeper::with_rounds(rounds.unwrap())
-            };
-            grind(log_output, reference_path, test_path, duration_keeper)
-        }
-
+        Arguments::Grind(grind_args) => grind(grind_args),
         Arguments::Replay { log_path, test_path, reference_path } =>
             replay(log_path, reference_path, test_path)
     }.unwrap();
