@@ -53,6 +53,11 @@ struct GrindArguments {
     /// If this number is reached, no new files will be created for the duration of the
     /// assessment.
     max_created_files: Option<usize>,
+    #[structopt(long, default_value = "1024")]
+    /// Maximum size of one write.
+    ///
+    /// fsgrinder will randomly write between 1 and max_write_size bytes per write operation.
+    max_write_size: usize,
 }
 
 #[derive(Debug, StructOpt)]
@@ -151,7 +156,8 @@ struct RandFSOpGenerator<R: Rng> {
     max_open_files: Option<usize>,
     max_created_files: Option<usize>,
     open_files: Vec<OpenFileDescriptor>,
-    existing_files: Vec<FileDescriptor>
+    existing_files: Vec<FileDescriptor>,
+    max_write_size: usize,
 }
 
 trait RemoveRandomEntry {
@@ -185,20 +191,18 @@ impl<R: Rng> Iterator for RandFSOpGenerator<R> {
                     self.existing_files.push(closed_file);
                     break result;
                 },
-                1 => {
-                    if !self.max_created_files_reached() {
-                        let name_len = self.rng.gen_range(6, 32);
-                        let name = (&mut self.rng).sample_iter(Alphanumeric).take(name_len).collect::<String>();
-                        let path = PathBuf::from(name);
-                        self.open_files.push(OpenFileDescriptor {
-                            file_desc: FileDescriptor { path: path.clone(), }
-                        });
+                1 => if !self.max_created_files_reached() {
+                    let name_len = self.rng.gen_range(6, 32);
+                    let name = (&mut self.rng).sample_iter(Alphanumeric).take(name_len).collect::<String>();
+                    let path = PathBuf::from(name);
+                    self.open_files.push(OpenFileDescriptor {
+                        file_desc: FileDescriptor { path: path.clone(), }
+                    });
 
-                        break FSOperation::CreateFile { file_path: path };
-                    }
+                    break FSOperation::CreateFile { file_path: path };
                 },
-                2 => if let Some(open_file) = self.existing_files.remove_random(&mut self.rng) {
-                    if !self.max_open_files_reached() {
+                2 => if !self.max_open_files_reached() {
+                    if let Some(open_file) = self.existing_files.remove_random(&mut self.rng) {
                         let result = FSOperation::OpenFile { file_path: open_file.path.clone() };
                         self.open_files.push(OpenFileDescriptor {
                             file_desc: open_file
@@ -219,8 +223,11 @@ impl<R: Rng> Iterator for RandFSOpGenerator<R> {
                         seek_pos: SeekPos { seek_mode, rel_seek_pos } };
                 },
                 4 => if let Some(file) = self.open_files.choose_mut(&mut self.rng) {
-                    let written_size = self.rng.gen_range(1, 2048);
-                    break FSOperation::WriteRandomData { file_path: file.file_desc.path.clone(), written_size };
+                    let written_size = self.rng.gen_range(1, self.max_write_size) as u64;
+                    break FSOperation::WriteRandomData {
+                        file_path: file.file_desc.path.clone(),
+                        written_size,
+                    };
                 },
                 5 => if let Some(file) = self.open_files.choose_mut(&mut self.rng) {
                     let read_size = self.rng.gen_range(1, 2048);
@@ -238,11 +245,13 @@ impl<R: Rng> Iterator for RandFSOpGenerator<R> {
 }
 
 impl<R: Rng> RandFSOpGenerator<R> {
-    fn new(rng: R, max_open_files: Option<usize>, max_created_files: Option<usize>) -> Self {
+    fn new(rng: R, max_write_size: usize, max_open_files: Option<usize>,
+           max_created_files: Option<usize>) -> Self {
         Self {
             rng,
             max_open_files,
             max_created_files,
+            max_write_size,
             open_files: Default::default(),
             existing_files: Default::default()
         }
@@ -256,7 +265,10 @@ impl<R: Rng> RandFSOpGenerator<R> {
 
     fn max_created_files_reached(&self) -> bool {
         self.max_created_files
-            .map(|cf| self.open_files.len() + self.existing_files.len() >= cf)
+            .map(|cf| {
+                debug!("open_files.len: {}, existing_files.len: {}", self.open_files.len(), self.existing_files.len());
+                self.open_files.len() + self.existing_files.len() >= cf
+            })
             .unwrap_or(false)
     }
 }
@@ -482,7 +494,8 @@ fn grind(grind_args: GrindArguments) -> Fallible<()> {
         timeout,
         rounds,
         max_created_files,
-        max_open_files
+        max_open_files,
+        max_write_size
     } = grind_args;
 
     let mut duration_keeper = if let Some(timeout) = timeout {
@@ -510,7 +523,8 @@ fn grind(grind_args: GrindArguments) -> Fallible<()> {
     let mut serializer = serde_json::Serializer::pretty(output);
     let mut op_log_and_execute = FSOperationSerializer::new(&mut serializer, operation_executor)?;
 
-    let fs_op_gen = RandFSOpGenerator::new(fs_op_rng, max_open_files, max_created_files);
+    let fs_op_gen =
+        RandFSOpGenerator::new(fs_op_rng, max_write_size, max_open_files, max_created_files);
 
     for op in fs_op_gen.take_while(move |_| !duration_keeper.elapsed()) {
         op_log_and_execute.execute_fs_operation(op)?;
